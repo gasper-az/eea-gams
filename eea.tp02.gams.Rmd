@@ -1,0 +1,421 @@
+---
+title: "eea.tp02.gams"
+author: "Gaspar Acevedo Zain; Lucas Bertolini"
+date: "12/3/2021"
+output: html_document
+---
+# Trabajo Práctico Nro 02
+
+## Configuración Básica
+### Instalación de paquetes
+<p> Comenzamos instalando los paquetes y las librerias necesarias </p>
+
+```{r echo=T, results = 'hide'}
+`%notin%` <- Negate(`%in%`)
+
+# Esta función nos permite instalar y cargar paquetes
+# packages debe ser una lista
+install.packages.func <- function(packages) {
+  not.installed.packages <- packages %notin% rownames(installed.packages())
+  if (any(not.installed.packages == TRUE)) {
+    # instalamos los paquetes
+    install.packages(packages[not.installed.packages])
+  }
+  # cargamos los paquetes
+  lapply(packages, library, character.only = TRUE)
+}
+
+## Instalamos y cargamos los siguientes paquetes
+packages <- c('devtools',
+              'tidyverse',
+              'ggplot2',
+              'gridExtra',
+              'corrr',
+              'plyr',
+              'dplyr',
+              'tidyverse',
+              'gam',
+              'gamlss',
+              'tibble'
+              )
+
+install.packages.func(packages)
+```
+
+### Carga de datasets en memoria
+
+<p> Cargamos los datasets en memoria </p>
+<p><strong>Importante</strong>: si se desea ejecutar este script, setear correctamente la variable <i>base.dir</i>, la cual debe ser el path al directorio donde se encuentran los archivos a procesar </p>
+
+<p>Nuestro dataset consiste en valores históricos del precio del oro, además de otras tantas variables que corresponden diversos valores de índices de mercado.</p>
+<p>En este caso, buscaremos predecir la variable <strong>Adj.Close</strong>, la cual representa el precio del cierre de mercado del Oro para un día dado, teniendo en cuenta factores tales como dividendos, división de acciones, y nueva ofertas de acciones.</p>
+<p>Tanto el dataset como la definición dada anteriormente fue sacada de Kaggle:</p> <p>https://www.kaggle.com/sid321axn/gold-price-prediction-dataset</p>
+
+```{r}
+base.dir <- "C://MyRepos//eea-gams"
+gold.price.file <- "gold_price.csv"
+
+gold.price.ds <- read.csv(paste(base.dir,gold.price.file, sep = "//"), encoding="UTF-8")
+```
+
+### Seteamos una semilla para hacer reproducibles los resultados
+
+```{r}
+seed <- 21283
+set.seed(seed)
+```
+
+## Análisis exploratorio
+### Separación de variables numéricas y NO numéricas
+```{r}
+col.numericas <- gold.price.ds %>% dplyr::select(where(is.numeric)) %>% colnames
+col.no.numericas <- gold.price.ds %>% dplyr::select(-all_of(col.numericas)) %>% colnames
+```
+
+### Valores únicos y faltantes
+```{r}
+showUniqueAndMissingValues <- function(df, cols) {
+  ds <- df %>% dplyr::select(all_of(cols))
+  
+  ds %>% pivot_longer(cols = cols, names_to = 'variables', values_to = 'valores') %>%
+    group_by(variables) %>%
+    dplyr::summarise(uniques = n_distinct(valores),
+                     missing_values = sum(is.na(valores))/nrow(ds)*100
+                     ) %>%
+    arrange(desc(missing_values), uniques)
+}
+```
+
+### Valores únicos y faltantes de columnas numéricas
+```{r}
+showUniqueAndMissingValues(gold.price.ds, col.numericas)
+```
+<p>Como se puede observar, las columnas numéricas NO presentan datos faltantes</p>
+
+#### Matriz de correlación de variables numéricas
+<p>A continuación, obtenemos la matriz de correlación de las variables numéricas.</p>
+<p>Haremos énfasis en la variable <strong>Adj.Close</strong>, que es nuestra variable a predecir.</p>
+```{r}
+corr.matrix <- gold.price.ds %>% dplyr::select(all_of(col.numericas)) %>% correlate(use = "complete.obs", method = "pearson") %>% shave() %>% dplyr::select(c("term", "Adj.Close"))  %>% fashion()
+corr.matrix
+```
+
+#### Scatterplot Adj. Close (oro) vs. Down Jones Adj. Close
+<p>Ahora, procedemos a realizar un scatterplot de las variables <strong>Adj.Close</strong> y <strong>DJ_Ajclose</strong>, siendo esta última el cierra ajustado del índice Down Jones.</p>
+
+```{r}
+ggplot(gold.price.ds, aes(x=DJ_Ajclose, y=Adj.Close)) + geom_point() + xlab('Down Jones Adj. Close') + ylab('Gold Adj. Close')
+```
+
+## Generalized Linear Models
+### Splines
+#### Cubic Splines
+
+<p>En el siguiente ejemplo, procederemos a realizar un ejemplo de <strong>Cubic Splines</strong>.</p>
+<p>Para facilitar tanto el cálculo como la comprensión del mismo, trabajaremos con las columnas <strong>Adj.Close</strong>, la cual será nuestra variable objetivo, y <strong>DJ_Ajclose</strong>, siendo esta última columna nuestra covariable.</p>
+
+<p>Nuestra función base será de la forma:</p>
+<p><strong>b1(x) = 1</strong></p>
+<p><strong>b2(x) = x</strong></p>
+<p><strong>bn(x) = R(x, z)</strong> para n entre 3 y q-2, siendo Q el <strong>coeficiente de suavidad<strong>.</p>
+
+<p>Primero, definimos la función <strong>rk</strong>, mas formalmente conocida como <strong>R(x, z)</strong>, la cual nos permite obtener las <strong>funciones bases</strong> correspondientes a polinomios con grado mayor o igual a 2, tal como fue definida por Wahba y Gu en diversos libros.</p>
+
+<p><strong>Fuente</strong>: Generalized Additive Models: an introduction with R - Simon N. Wood - Capítulo 3.2.2.</p>
+
+```{r}
+## función R(x,z)
+rk <- function(x, z) {
+  ((z-0.5)**2 - 1/12) * ((x-0.5)**2 - 1/12) / 4 - ((abs(x-z)-0.5)**4 - 0.5 * (abs(x-z)-0.5)**2 +7/240)/24
+}
+```
+
+<p>A continuación, creamos otra función que nos permite obtener una matriz modelo para los splines a partir de una serie de valores observados (x), y una secuencia de knots.</p>
+
+<p><strong>Fuente</strong>: Generalized Additive Models: an introduction with R - Simon N. Wood - Capítulo 3.2.2.</p>
+
+```{r}
+### x: vector de observaciones
+### xk: vector de knots
+spl.X<-function(x,xk) {
+  q <- length(xk) + 2 # Q representa el grado de suavidad, el cual siempre es (cantidad de knots) + 2
+  n <- length(x) # cantidad de observaciones
+  X <- matrix(1,n,q) # creamos una matriz de n filas y q columnas, inicializándola con unos
+  
+  ## La primer columna está inicializada en 1. Corresponde a B1(x) = 1
+  
+  X[,2] <- x # la segunda columna toma los valores observados. Corresponde a B2(x) = x
+  
+  # aplicamos al resto de las columnas la función rk ó R(x,xk) definida anteriormente
+  X[,3:q] <- outer(x, xk , FUN=rk) 
+  X
+}
+```
+
+<p>Por último, para facilitar más el cálculo de los splines y de las funciones base para este ejemplo, realizaremos un escalado de la variable <strong>Adj.Close<strong> al rango (0,1). Para eso, definimos la función <strong>scaleTo01<strong>.</p>
+
+```{r}
+scaleTo01 <- function(x) {
+  (x-min(x)) / (max(x) - min(x))
+}
+```
+
+<p>Ya definidas las funciones, procedemos a realizar un <strong>Cubic Spline<strong> para una función de rango de suavizado <strong>q = 6<strong>. Esto indica que estaremos utilizando q-2 = <strong>4 knots<strong>.</p>
+
+<p><strong>Fuente</strong>: Generalized Additive Models: an introduction with R - Simon N. Wood - Capítulo 3.2.2.</p>
+
+```{r}
+## Q representa el coeficiente de suavidad. Este es igual a la cantidad de knots + 2
+q <- 6
+## Calculamos los knots. Estos serán entre 1 y q-2 knots.
+## Luego, los distribuímos equitativamente en el intervalo (0,1). Para ello, dividimos por (q-1), así evitamos
+## que el último knot caiga en el punto 1, ya que (q-2)/(q-1) es menor a 1.
+dj.adj.close.knots <- 1:(q-2)/(q-1)
+
+## ajustamos la variable DJ_Ajclose al rango 0-1
+dj.adj.close.01 <- scaleTo01(gold.price.ds$DJ_Ajclose)
+
+## generamos la matriz modelo
+mat.modelo <- spl.X(dj.adj.close.01, dj.adj.close.knots)
+
+## Ajustamos un modelo lineal, en donde nuestra covariable es el índice ajustado de cierre de Down Jones (DJ_Ajclose) escalado en el rango 0-1, y nuestra variable predictora la matriz modelo calculada anteriormente
+model.dj.x.adj.close <- lm(gold.price.ds$Adj.Close ~ mat.modelo-1)
+
+## generamos una matriz para realizar predicciones
+x.prediction <- 0:100/100
+
+## ajustamos el modelo
+mat.modelo.prediction <- spl.X(x.prediction, dj.adj.close.knots)
+```
+
+<p>Por último, graficamos el scatterplot original con una curva que representa el regression spline:</p>
+```{r}
+## definimos el siguiente dataset para facilitar el gráfico
+df = data.frame(x = x.prediction, y = as.vector(mat.modelo.prediction%*%coef(model.dj.x.adj.close)))
+
+ggplot(gold.price.ds, aes(x=dj.adj.close.01, y=Adj.Close)) +
+  geom_point() +
+  geom_line(data=df, aes(x=x, y=y), colour='red') +
+  xlab('Down Jones Adj. Close (escalado)') + ylab('Gold Adj. Close') +
+  labs(title = 'Down Jones Adj. Close (escalado) vs Gold Adj. Close')
+```
+
+<p>A continuación, realizamos el mismo suavizado por cubic splines en las mismas variables, pero esta vez utilizando las funciones provistas por la library <strong>gamlss</strong>.</p>
+```{r}
+## Definimos un dataset nuevo en donde la X corresponde a la variable DJ_Ajclose escalado en 0-1, y la Y
+## corresponde a la variable a predecir, Adj.Close, perteneciendo ambas variables al dataset original
+df2 <- data.frame(x=dj.adj.close.01, y=gold.price.ds$Adj.Close)
+
+## Utilizamos la función gamlss
+## Primero, debemos definir una regresión en la cual se indique que queremos ajustarla utilizando cubic splines
+## Para ello, utilizamos la función cs, la cual toma como parámetro la variable regresora, y
+## los grados de libertad (df), que en nuestro caso corresponden a la cantidad de knots (Q-2, siendo Q=6)
+## Family = GA indica que estaremos utilizando como base una función GAMMA
+rcs1<-gamlss(y~cs(x, df = 4), data=df2, family=GA, trace=FALSE)
+
+ggplot(df2, aes(x=x,y=y)) + 
+  geom_point() +
+  geom_line(data=df2, aes(x=x, y=fitted(rcs1)), colour='red') +
+  xlab('Down Jones Adj. Close (escalado)') + ylab('Gold Adj. Close') +
+  labs(title = 'Down Jones Adj. Close (escalado) vs Gold Adj. Close')
+```
+
+#### Penalized Regression Splines
+
+<p>A continuación, realizaremos un ejemplo aplicando <strong>Penalized Regression Splines</strong>.</p>
+<p><strong>Fuente</strong>: Generalized Additive Models: an introduction with R - Simon N. Wood - Capítulo 3.2.2.</p>
+
+<p>Definimos una función que nos permite obtener la matriz de penalización <strong>S</strong>.</p>
+```{r}
+# esta función nos permite definir la matriz de penalización S (ver teoría)
+spl.S<-function(xk) { 
+  q <- length(xk) + 2; ## Q: coeficiente de suavidad. Cant. de knots + 2
+  S <- matrix(0, q, q) ## inicializamos la matriz con ceros
+  S[3:q,3:q] <- outer(xk,xk,FUN=rk) ## completamos la matriz con la función rk, definida en el ejemplo anterior
+  S
+}
+```
+
+<p>Ahora definimos una función que nos permite obtener el coeficiente <strong>B</strong>, el cual corresponde a la raíz de <strong>S</strong></p>
+
+<p><strong>Fuente</strong>: Generalized Additive Models: an introduction with R - Simon N. Wood - Capítulo 3.2.2.</p>
+```{r}
+## S: matriz de penalización
+mat.sqrt <- function(S) { 
+  d <- eigen(S,symmetric=TRUE)
+  rS <- d$vectors%*%diag(d$values**0.5)%*%t(d$vectors)
+}
+```
+
+
+<p>Por último, definimos una función que nos permite ajustar una serie de datos utilizando penalized regression splines, mediante un <strong>parámetro de suavizado (lambda)</strong> dado.</p>
+
+<p><strong>Fuente</strong>: Generalized Additive Models: an introduction with R - Simon N. Wood - Capítulo 3.2.2.</p>
+
+```{r}
+prs.fit <- function(y,x,xk,lambda){ 
+  q <- length(xk) + 2
+  n <- length(x)
+  Xa <- rbind(spl.X(x,xk), mat.sqrt(spl.S(xk))*sqrt(lambda))
+  y[(n+1):(n+q)] <- 0
+  lm(y~Xa-1) # ajustamos and devolvemos el penalized regression spline
+}
+```
+
+<p>Definimos una función que nos permita graficar los penalized regression splines, dados ciertos parámetros.</p>
+
+```{r}
+grafico.penalized.reg.spline <- function(x.data, y.data, knots, lambda, dataset) {
+  mod.penalized.reg.spline <- prs.fit(y.data, x.data, knots, lambda)
+
+  x.prediction <- 0:100/100 # valores para predicción
+  
+  Xp <- spl.X(x.prediction, knots) # mapeamos los valores ajustados de xp
+  
+  # creamos un dataframe temporal para facilitar el gráfico
+  df = data.frame(x = x.prediction, y = as.vector(Xp%*%coef(mod.penalized.reg.spline)))
+  
+  grafico <- ggplot(dataset, aes(x=x.data, y=y.data)) +
+    geom_point() +
+    geom_line(data=df, aes(x=x, y=y), colour='red') +
+    xlab('Down Jones Adj. Close (escalado)') + ylab('Gold Adj. Close') +
+    labs(title = paste0('Down Jones Adj. Close (escalado) vs Gold Adj. Close', " - Lambda: ", lambda))
+  
+  return(grafico)
+}
+```
+
+<p>Por último, realizamos 4 ajustes utilizando penalized regression splines. La diferencia en cada caso radica en el <strong>coeficiente de suavizado (lambda)</strong> utilizado.</p>
+
+```{r}
+Q <- 9
+knots <- 1:(Q-2)/(Q-1)
+## Utilizamos nuevamente como covariable a al índice Down Jones al cierre ajustado y escalado al rango 0-1
+covariable <- scaleTo01(gold.price.ds$DJ_Ajclose)
+var.objetivo <- gold.price.ds$Adj.Close
+
+grafico.01 <- grafico.penalized.reg.spline(covariable, var.objetivo, knots, lambda = 10, gold.price.ds)
+grafico.02 <- grafico.penalized.reg.spline(covariable, var.objetivo, knots, lambda = 1, gold.price.ds)
+grafico.03 <- grafico.penalized.reg.spline(covariable, var.objetivo, knots, lambda = 0.001, gold.price.ds)
+grafico.04 <- grafico.penalized.reg.spline(covariable, var.objetivo, knots, lambda = 0.0000001, gold.price.ds)
+```
+
+```{r}
+# Permite mostrar todos los gráficos juntos
+# grid.arrange(grafico.01, grafico.02, grafico.03, grafico.04, nrow = 1)
+```
+
+```{r}
+grafico.01
+```
+
+```{r}
+grafico.02
+```
+
+```{r}
+grafico.03
+```
+
+```{r}
+grafico.04
+```
+
+### Ejemplo práctico
+#### GAM vs Modelo Lineal
+
+<p>En el siguiente ejemplo crearemos diversos modelos en función del dataset de análisis, con el fin de comparar la performance del mismo para predecir el valor del índice ajustado al cierre del oro, utilizando las siguiente variables regresoras:</p>
+<ul>
+<li><strong>DJ_Ajclose</strong>: índice Down Jones ajustado al cierre.</li>
+<li><strong>SP_Ajclose</strong>: índice S&P 500 ajustado al cierre.</li>
+<li><strong>SF_Volume</strong>: volumen al cierre de los Silver futures.</li>
+</ul>
+
+<p>Primero definimos un modelo lineal utilizando la función <strong>gamlss</strong>.</p>
+```{r}
+modelo.lineal <- gamlss(
+    formula = Adj.Close ~ DJ_Ajclose + SP_Ajclose + SF_Volume,
+    data = gold.price.ds,
+    family = NO, ## distribución Normal para la variable respuesta
+    trace = FALSE
+  )
+```
+
+<p>Ahora, crearemos varios modelos GAM, los cuales se caracterizan por tener tres <i>smoothing functions</i> utilizando <i>cubic splines</i> mediante la función <i>cs()</i> de la librería gamlss.</p>
+```{r}
+## Cubic Splines: 3 functions
+## Grados de libertad: 3
+## Family: Gamma (GA)
+gam.3cs.ga.3df <- gamlss(
+    formula = Adj.Close ~ cs(DJ_Ajclose) + cs(SP_Ajclose) + cs(SF_Volume),
+    data = gold.price.ds,
+    family = GA, ## distribución GAMMA para la variable respuesta
+    trace = FALSE
+  )
+
+## Cubic Splines: 3 functions
+## Grados de libertad: 5
+## Family: Gamma (GA)
+gam.3cs.ga.5df <- gamlss(
+    formula = Adj.Close ~ cs(DJ_Ajclose, df=5) + cs(SP_Ajclose, df=5) + cs(SF_Volume, df=5),
+    data = gold.price.ds,
+    family = GA, ## distribución GAMMA para la variable respuesta
+    trace = FALSE
+  )
+```
+
+<p>A continuación, definimos varios modelos GAM, los cuales se caracterizan por tener una <i>smoothing functions</i> utilizando <i>cubic splines</i>.</p>
+```{r}
+## Cubic Splines: 1 functions
+## Grados de libertad: 3
+## Family: Gamma (GA)
+gam.1cs.ga.3df <- gamlss(
+    formula = Adj.Close ~ cs(DJ_Ajclose + SP_Ajclose + SF_Volume),
+    data = gold.price.ds,
+    family = GA, ## distribución GAMMA para la variable respuesta
+    trace = FALSE
+  )
+
+## Cubic Splines: 1 functions
+## Grados de libertad: 5
+## Family: Gamma (GA)
+gam.1cs.ga.5df <- gamlss(
+    formula = Adj.Close ~ cs(DJ_Ajclose + SP_Ajclose + SF_Volume, df = 5),
+    data = gold.price.ds,
+    family = GA, ## distribución GAMMA para la variable respuesta
+    trace = FALSE
+  )
+```
+
+
+<p>A continuación, procedemos a comparar los modelos definidos anteriormente.</p>
+<p>Para ello, utilizaremos la función <strong>gaic</strong>, la cual nos devuelve el <strong>AIC (Akaike information criteria)</strong>.</p>
+<p>Este valor AIC nos permitirá determinar cual de estos modelos es el más adecuado para el dataset analizado.</p>
+<p>A menor AIC, más adecuado es el modelo</p>
+```{r}
+GAIC(
+  modelo.lineal,
+  gam.3cs.ga.3df, 
+  gam.3cs.ga.5df, 
+  gam.1cs.ga.3df,
+  gam.1cs.ga.5df
+) %>% tibble::rownames_to_column("modelo") %>% arrange(AIC)
+```
+<p>Como se puede observar, el modelo con menor <strong>AIC<strong> es el modelo <strong>gam.3cs.ga.5df</strong>, que corresponde al modelo que tiene 3 cubic splines, utiliza una función con distribución GAMMA, y emplea 5 grados de libertad para cada smoothing function.</p>
+
+```{r}
+best.model <- gam.3cs.ga.5df
+```
+
+<p>La siguiente función grafica la relación de cada predictor con la variable respuesta.</p>
+<p>Cada gráfico muestra la relación entre el logaritmo de la media de la variable respuesta con cada predictor.</p>
+```{r}
+term.plot(best.model, parallel = "multicore", ncpus = 4, ask = FALSE)
+```
+
+<p>Por último, utilizando la función <strong>drop1</strong> analizamos cómo impacta al modelo (en términos de grados de libertad, AIC, y significancia estadística) eliminar cada uno de los predictores.</p>
+```{r}
+drop1(best.model, pages = 1, ask = FALSE, rug = TRUE)
+```
+
+
